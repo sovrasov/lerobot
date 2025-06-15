@@ -1,6 +1,7 @@
 import socket
 
 from enum import Enum
+import subprocess
 
 class LaCrocCommands(Enum):
     talk = "<TALK>"
@@ -16,7 +17,7 @@ COMMAND_2_EPISODE = {
     LaCrocCommands.yes.value: 1,
     LaCrocCommands.no.value: 2,
     LaCrocCommands.speak.value: 5,
-    LaCrocCommands.bring_ball.value: 8,
+    LaCrocCommands.bring_ball.value: -1,
 }
 
 import logging
@@ -70,17 +71,26 @@ def server_program(cfg: ReplayConfig):
     logging.info(pformat(asdict(cfg)))
 
     robot = make_robot_from_config(cfg.robot)
-    #dataset = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, episodes=[cfg.dataset.episode])
-    #actions = dataset.hf_dataset.select_columns("action")
     robot.connect()
 
-
-    log_say("Replaying episode", cfg.play_sounds, blocking=True)
-
-
-
+    def run_inference():
+        subprocess.run(["rm -rf /home/sovrasov/.cache/huggingface/lerobot/sovrasov/eval_red_ball_3"])
+        args = ["--robot.type=so101_follower",
+                "--robot.port=/dev/ttyACM1",
+                "--robot.id=hackafollower",
+                '--robot.cameras="{ top: {type: opencv, index_or_path: 3, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 5, width: 640, height: 480, fps: 30}}"',
+                "--display_data=false",
+                "--dataset.repo_id=sovrasov/eval_red_ball_3",
+                '--dataset.single_task="Put the red ball to the cup"',
+                '--policy.path=/home/sovrasov/.cache/huggingface/hub/models--kprokofi--lecroc_red_ball_3cams_50/snapshots/1b712a5e3e532e36e0eeb1a782e6d45842928004/pretrained_model/'
+        ]
+        subprocess.run(["python", "-m", "lerobot.record", args])
 
     def run_action(episode_idx: int):
+        if episode_idx < 0:
+            run_inference()
+            return
+
         dataset = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, episodes=[episode_idx])
         actions = dataset.hf_dataset.select_columns("action")
 
@@ -99,7 +109,7 @@ def server_program(cfg: ReplayConfig):
 
 
     # get the hostname
-    host = ""#socket.gethostname()
+    host = ""
     port = 33333  # initiate port no above 1024
 
     server_socket = socket.socket()  # get instance

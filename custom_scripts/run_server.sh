@@ -1,4 +1,4 @@
-python -m lerobot.replay \
+python custom_scripts/server_lecroc.py \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM1 \
     --robot.id=hackafollower \
