@@ -50,6 +50,9 @@ def auto_select_torch_device() -> torch.device:
     elif torch.backends.mps.is_available():
         logging.info("Metal backend detected, using mps.")
         return torch.device("mps")
+    elif torch.xpu.is_available():
+        logging.info("Intel XPU backend detected, using xpu.")
+        return torch.device("xpu")
     else:
         logging.warning("No accelerated backend detected. Using default cpu, this will be slow.")
         return torch.device("cpu")
@@ -66,6 +69,9 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
         case "mps":
             assert torch.backends.mps.is_available()
             device = torch.device("mps")
+        case "xpu":
+            assert torch.xpu.is_available()
+            device = torch.device("xpu")
         case "cpu":
             device = torch.device("cpu")
             if log:
@@ -80,11 +86,11 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
 
 def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
     """
-    mps is currently not compatible with float64
+    mps and xpu are currently not compatible with float64
     """
     if isinstance(device, torch.device):
         device = device.type
-    if device == "mps" and dtype == torch.float64:
+    if (device == "mps" or device == "xpu") and dtype == torch.float64:
         return torch.float32
     else:
         return dtype
@@ -98,12 +104,14 @@ def is_torch_device_available(try_device: str) -> bool:
         return torch.backends.mps.is_available()
     elif try_device == "cpu":
         return True
+    elif try_device == "xpu":
+        return torch.xpu.is_available()
     else:
-        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, mps or cpu.")
+        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu or cpu.")
 
 
 def is_amp_available(device: str):
-    if device in ["cuda", "cpu"]:
+    if device in ["cuda", "cpu", "xpu"]:
         return True
     elif device == "mps":
         return False
