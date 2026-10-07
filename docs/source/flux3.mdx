@@ -28,6 +28,11 @@ uv pip install natten==0.21.6+torch2110cu128 --find-links https://whl.natten.org
 
 Use `natten==0.21.6+torch2100cu128` for torch 2.10, or build for your environment.
 
+Without NATTEN, or on devices other than CUDA/CPU (e.g. Intel XPU), the Video VAE falls back to a pure
+PyTorch neighborhood-attention mask (`F3_NATTEN_BACKEND=torch-flex` forces it). It runs a dense SDPA in
+eager mode and a fused `flex_attention` kernel with `--policy.compile_model=true`. The eager path holds a
+dense attention mask, so it suits single-frame inference better than multi-frame clips.
+
 ## SO-101 task adaptation
 
 Use a LeRobot v3 dataset at **30 Hz**, with six absolute commanded-action channels and six measured-state

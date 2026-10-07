@@ -60,13 +60,10 @@ def test_vae_dependency_errors(failure):
             assert str(exc) == expected[failure], exc
         else:
             assert failure == "missing"
-            try:
-                f3.load_video_vae(None)
-            except ImportError as exc:
-                assert "requires NATTEN" in str(exc), exc
-                assert "whl.natten.org" in str(exc), exc
-            else:
-                raise AssertionError("VAE construction should require NATTEN")
+            from lerobot.policies.flux3.f3 import video_vae
+
+            q = importlib.import_module("torch").zeros(1, 4, 4, 1, 8)
+            assert video_vae._resolve_na_backend(q, q, q) == video_vae._TORCH_FLEX_BACKEND
         """
     )
     result = subprocess.run(

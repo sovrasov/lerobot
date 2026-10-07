@@ -14,6 +14,7 @@
 # Vendored from black-forest-labs/flux-action (src/flux_action/models/video_vae.py).
 """Video VAE (ViTNormInference). Swin3D + neighborhood attention with built-in DistributedRunningStats normalization."""
 
+import functools
 import logging
 import math
 import os
@@ -30,8 +31,9 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, create_mask, flex_attention
 
-from lerobot.utils.import_utils import _natten_available, require_package
+from lerobot.utils.import_utils import _natten_available
 
 from ..utils import resolve_weights
 from .positional import prc_vid, scatter_ids, times_to_ids
@@ -49,18 +51,24 @@ _norm_layer = partial(nn.LayerNorm, eps=1e-5)
 # some GPU architectures, so the fastest supported backend is probed at
 # runtime: blackwell (SM100) > hopper (SM90) > generic CUTLASS > flex-attention
 # (pure torch, runs everywhere at a speed/memory cost). Set $F3_NATTEN_BACKEND
-# (blackwell-fna | hopper-fna | cutlass-fna | flex-fna) to override.
+# (blackwell-fna | hopper-fna | cutlass-fna | flex-fna | torch-flex) to override.
+# ``torch-flex`` bypasses NATTEN with a PyTorch flex_attention mask (fused when compiled, dense SDPA
+# when eager); it is picked automatically when NATTEN is missing or the device is neither CUDA nor
+# CPU (e.g. XPU).
 _NATTEN_BACKEND_ENV = "F3_NATTEN_BACKEND"
+_TORCH_FLEX_BACKEND = "torch-flex"
 _PERSISTENT_KERNEL_BACKENDS = ("blackwell-fna", "hopper-fna")
 _natten_backends: dict[int, str] = {}
 
 
-def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
+def _resolve_na_backend(q: Tensor, k: Tensor, v: Tensor) -> str:
     backend = _natten_backends.get(q.ndim)
     if backend is None:
         backend = os.environ.get(_NATTEN_BACKEND_ENV)
         if not backend:
-            if nb.can_run_cutlass_blackwell_fna(q, k, v):
+            if not _natten_available or q.device.type not in ("cuda", "cpu"):
+                backend = _TORCH_FLEX_BACKEND
+            elif nb.can_run_cutlass_blackwell_fna(q, k, v):
                 backend = "blackwell-fna"
             elif nb.can_run_cutlass_hopper_fna(q, k, v):
                 backend = "hopper-fna"
@@ -70,10 +78,72 @@ def _natten_attention_kwargs(q: Tensor, k: Tensor, v: Tensor) -> dict:
                 backend = "flex-fna"  # universal fallback, no compiled kernels needed
         logger.info("natten backend (%dD tokens): %s", q.ndim - 3, backend)
         _natten_backends[q.ndim] = backend
+    return backend
+
+
+def _natten_attention_kwargs(backend: str) -> dict:
     kwargs: dict[str, str | bool] = {"backend": backend}
     if backend in _PERSISTENT_KERNEL_BACKENDS:
         kwargs["run_persistent_kernel"] = True
     return kwargs
+
+
+def _na_mask_mod(shape: tuple[int, ...], kernel_size: tuple[int, ...], is_causal: tuple[bool, ...]):
+    """Flex mask_mod reproducing NATTEN's neighborhood (stride 1, dilation 1, row-major tokens)."""
+
+    def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        keep = None
+        q_rest, kv_rest = q_idx, kv_idx
+        for size, ks, causal in reversed(list(zip(shape, kernel_size, is_causal, strict=True))):
+            q, kv = q_rest % size, kv_rest % size
+            q_rest, kv_rest = q_rest // size, kv_rest // size
+            if causal:
+                m = (q >= kv) & (q - kv < ks)
+            else:
+                # Windows are shifted (not truncated) at the borders, as in NATTEN.
+                left, right = ks // 2, (ks - 1) // 2
+                offset = kv - q.clamp(left, size - 1 - right)
+                m = (offset >= -left) & (offset <= right)
+            keep = m if keep is None else keep & m
+        return keep
+
+    return mask_mod
+
+
+@functools.lru_cache(maxsize=32)
+def _na_block_mask(
+    shape: tuple[int, ...], kernel_size: tuple[int, ...], is_causal: tuple[bool, ...], device: torch.device
+) -> BlockMask:
+    seq_len = math.prod(shape)
+    mask_mod = _na_mask_mod(shape, kernel_size, is_causal)
+    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
+
+
+@functools.lru_cache(maxsize=32)
+def _na_dense_mask(
+    shape: tuple[int, ...], kernel_size: tuple[int, ...], is_causal: tuple[bool, ...], device: torch.device
+) -> Tensor:
+    seq_len = math.prod(shape)
+    mask_mod = _na_mask_mod(shape, kernel_size, is_causal)
+    return create_mask(mask_mod, None, None, seq_len, seq_len, device=device)
+
+
+def _torch_flex_na(
+    q: Tensor, k: Tensor, v: Tensor, kernel_size: list[int], is_causal: list[bool] | None = None
+) -> Tensor:
+    """Neighborhood attention without NATTEN; ``q/k/v`` are ``(B, *spatial, heads, dim)``.
+
+    Under ``torch.compile`` this is a fused flex_attention kernel. In eager mode flex_attention would
+    re-evaluate the mask_mod densely on every call, so the same mask is materialized once and fed to SDPA.
+    """
+    b, *spatial, heads, dim = q.shape
+    key = (tuple(spatial), tuple(kernel_size), tuple(is_causal or (False,) * len(spatial)), q.device)
+    q_, k_, v_ = (t.reshape(b, -1, heads, dim).transpose(1, 2) for t in (q, k, v))
+    if torch.compiler.is_compiling():
+        out = flex_attention(q_, k_, v_, block_mask=_na_block_mask(*key))
+    else:
+        out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=_na_dense_mask(*key))
+    return out.transpose(1, 2).reshape(q.shape)
 
 
 @dataclass
@@ -369,22 +439,31 @@ class Natten3D(nn.Module):
 
         if t == 1:
             q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
-            out = na2d(
-                q2,
-                k2,
-                v2,
-                kernel_size=self.window_size[1:],
-                attention_kwargs=_natten_attention_kwargs(q2, k2, v2),
-            ).unsqueeze(1)
+            backend = _resolve_na_backend(q2, k2, v2)
+            if backend == _TORCH_FLEX_BACKEND:
+                out = _torch_flex_na(q2, k2, v2, self.window_size[1:]).unsqueeze(1)
+            else:
+                out = na2d(
+                    q2,
+                    k2,
+                    v2,
+                    kernel_size=self.window_size[1:],
+                    attention_kwargs=_natten_attention_kwargs(backend),
+                ).unsqueeze(1)
         else:
-            out = na3d(
-                q,
-                k,
-                v,
-                is_causal=[self.causal, False, False],
-                kernel_size=self.window_size,
-                attention_kwargs=_natten_attention_kwargs(q, k, v),
-            )
+            is_causal = [self.causal, False, False]
+            backend = _resolve_na_backend(q, k, v)
+            if backend == _TORCH_FLEX_BACKEND:
+                out = _torch_flex_na(q, k, v, self.window_size, is_causal)
+            else:
+                out = na3d(
+                    q,
+                    k,
+                    v,
+                    is_causal=is_causal,
+                    kernel_size=self.window_size,
+                    attention_kwargs=_natten_attention_kwargs(backend),
+                )
         out = out.reshape(b, t, h, w, c)
         return self.proj(out)
 
@@ -995,15 +1074,14 @@ def load_video_vae(
 
     ``weights``: ``None`` -> random init (shapes only, for wiring tests), a ``.safetensors`` file, a
     distributed-checkpoint directory (``.metadata`` + ``__*.distcp``), or a Hub ``repo_id[:filename]``
-    (default filename ``video_vae.safetensors``). Requires NATTEN to construct the model.
+    (default filename ``video_vae.safetensors``). Without NATTEN, neighborhood attention falls back to
+    a PyTorch flex_attention mask (dense SDPA when eager, fused flex kernel when compiled).
     """
-    try:
-        require_package("natten", "flux3")
-    except ImportError as e:
-        raise ImportError(
-            "The FLUX3 video VAE requires NATTEN. Install a torch/CUDA-matched wheel from "
-            "https://whl.natten.org; see docs/source/flux3.mdx."
-        ) from e
+    if not _natten_available:
+        logger.warning(
+            "NATTEN not installed; the FLUX3 video VAE uses PyTorch neighborhood-attention masks. Install a "
+            "torch/CUDA-matched wheel from https://whl.natten.org for fused kernels (docs/source/flux3.mdx)."
+        )
     params = ViTNormInferenceParams(
         use_compile=compile_model,
         compile_decoder=compile_model,
